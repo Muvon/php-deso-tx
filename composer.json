@@ -1,0 +1,34 @@
+{
+  "name": "muvon/bitclout-tx",
+  "description": "Bitclout raw tx parser",
+  "keywords": [
+    "binary",
+    "codec",
+    "transaction",
+    "encoder",
+    "decoder",
+    "bitclout",
+    "lightweight"
+  ],
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Muvon Co. Ltd",
+      "email": "contact@muvon.io"
+    }
+  ],
+  "minimum-stability": "dev",
+  "require-dev": {
+    "phpunit/phpunit": "^10"
+  },
+  "autoload": {
+    "psr-4": {
+      "Muvon\\Bitclout\\": "src/"
+    }
+  },
+  "require": {
+    "muvon/kiss-varint": "^0.2.0",
+    "muvon/base58-codec": "^0.1"
+  }
+}
