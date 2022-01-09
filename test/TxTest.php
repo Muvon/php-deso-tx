@@ -1,6 +1,6 @@
 <?php
 
-use Muvon\Bitclout\Tx;
+use Muvon\DeSo\Tx;
 use PHPUnit\Framework\TestCase;
 
 class TxTest extends TestCase {

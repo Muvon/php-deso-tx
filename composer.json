@@ -1,6 +1,6 @@
 {
-  "name": "muvon/bitclout-tx",
-  "description": "Bitclout raw tx parser",
+  "name": "muvon/deso-tx",
+  "description": "DeSo raw tx parser",
   "keywords": [
     "binary",
     "codec",
@@ -8,6 +8,7 @@
     "encoder",
     "decoder",
     "bitclout",
+    "deso",
     "lightweight"
   ],
   "type": "library",
@@ -24,11 +25,12 @@
   },
   "autoload": {
     "psr-4": {
-      "Muvon\\Bitclout\\": "src/"
+      "Muvon\\DeSo\\": "src/"
     }
   },
   "require": {
     "muvon/kiss-varint": "^0.2.0",
-    "muvon/base58-codec": "^0.1"
+    "muvon/base58-codec": "^0.1",
+    "simplito/elliptic-php": "dev-master"
   }
 }

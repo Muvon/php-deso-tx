@@ -1,11 +1,16 @@
 <?php
-namespace Muvon\Bitclout;
+namespace Muvon\DeSo;
 
-use InvalidArgumentException;
 use Muvon\KISS\VarInt;
 use Muvon\KISS\Base58Codec;
+use InvalidArgumentException;
+
 // https://github.com/bitclout/core/blob/main/lib/network.go
 class Tx {
+  const NETWORK_PREFIX = 'cd1400';
+  const ARCHITECT_PUBKEY_HEX = '8mkU8yaVLs';
+  const ARCHITECT_PUBKEY = '';
+
   const UNSET = 0;
   const BLOCK_REWARD = 1; // not implemented
   const BASIC_TRANSFER = 2; // null meta
@@ -34,6 +39,9 @@ class Tx {
   const COIN_SELL = 1;
   const COIN_ADD = 2;
 
+  const DERIVE_FORBID = 0;
+  const DERIVE_GRANT = 1;
+
   const BOOL_KEYS = [
     'IsQuotedReclout',
   ];
@@ -41,7 +49,7 @@ class Tx {
   const UINT_KEYS = [
     'USDCentsPerBitcoin',
     'MinNetworkFeeNanosPerKB',
-    'CreateProfileFeeNanosKey',
+    'CreateProfileFeeNanos',
     'CreateNFTFeeNanos',
     'MaxCopiesPerNFT',
   ];
@@ -50,26 +58,20 @@ class Tx {
     'DiamondLevel',
   ];
 
-  public static function fromBin(string $bin): array {
-    return static::fromHex(bin2hex($bin));
+  public static function fromHex(string $hex, bool $use_hex = false): array {
+    return static::fromBin(hex2bin($hex), $use_hex);
   }
 
-  public static function fromHex(string $hex): array {
-    [$inputs, $offset] = static::readInputs($hex, 0);
+  public static function fromBin(string $bin, bool $use_hex = false): array {
+    $tx_id = static::getTxId($bin);
 
-    $outputs = [];
-    [$output_cnt, $offset] = VarInt::readUint($hex, $offset);
-    while ($output_cnt-- > 0) {
-      $pubkey_hex = substr($hex, $offset, 66);
-      $offset += 66;
-      [$nanos, $offset] = VarInt::readUint($hex, $offset);
-      $outputs[] = [static::hexToBase58Check($pubkey_hex), $nanos];
-    }
+    [$inputs, $offset] = static::readInputs($bin, 0, $use_hex);
+    [$outputs, $offset] = static::readOutputs($bin, $offset, $use_hex);
 
-    [$type_id, $offset] = VarInt::readUint($hex, $offset);
-    [$meta_len, $offset] = VarInt::readUint($hex, $offset);
+    [$type_id, $offset] = VarInt::readUint($bin, $offset);
+    [$meta_len, $offset] = VarInt::readUint($bin, $offset);
 
-    $meta_raw = substr($hex, $offset, $meta_len * 2);
+    $meta_raw = substr($bin, $offset, $meta_len);
     $m_offset = 0;
     $meta = [];
 
@@ -79,22 +81,41 @@ class Tx {
         break;
 
       case static::BLOCK_REWARD:
-        [$meta['extra_data_hex'], $m_offset] = static::readString($meta_raw, $m_offset);
+        [$meta['extra_data'], $m_offset] = static::readString($meta_raw, $m_offset, $use_hex);
+        break;
+
+      case static::BITCOIN_EXCHANGE:
+        [$tx_bin, $m_offset] = static::readString($meta_raw, $m_offset);
+        $meta['tx_raw'] = static::adaptHex($tx_bin, $use_hex);
+        $meta['block_hash'] = static::reverseHash(bin2hex(substr($meta_raw, $m_offset, 32)));
+        $m_offset += 32;
+        $meta['merkle_root'] = static::reverseHash(bin2hex(substr($meta_raw, $m_offset, 32)));
+        $m_offset += 32;
+
+        [$proof_count, $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        $meta['merkle_proof'] = [];
+        while ($proof_count-- > 0) {
+          $meta['merkle_proof'][] = static::reverseHash(bin2hex(substr($meta_raw, $m_offset, 33)));
+          $m_offset += 33;
+        }
+
+        $meta['tx_id'] = static::reverseHash(static::getTxHashHex($tx_bin));
+        unset($tx_bin);
         break;
 
       case static::PRIVATE_MESSAGE:
-        $pubkey_hex = substr($meta_raw, $m_offset, 66);
-        $meta['pubkey'] = static::hexToBase58Check($pubkey_hex);
-        $m_offset += 66;
-        [$meta['text_hex'], $m_offset] =  static::readString($meta_raw, $m_offset);
+        $pubkey = substr($meta_raw, $m_offset, 33);
+        $meta['pubkey'] = static::adaptBase58Check($pubkey, $use_hex);
+        $m_offset += 33;
+        [$meta['text'], $m_offset] =  static::readString($meta_raw, $m_offset, $use_hex);
         [$meta['timestamp_nanos'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         break;
 
       case static::SUBMIT_POST:
-        [$meta['post_hex'], $m_offset] = static::readString($meta_raw, $m_offset);
-        [$meta['parent_post_hex'], $m_offset] = static::readString($meta_raw, $m_offset);
-        [$body_hex, $m_offset] = static::readString($meta_raw, $m_offset);
-        $meta['data'] = json_decode(hex2bin($body_hex), true);
+        [$meta['post_hash'], $m_offset] = static::readString($meta_raw, $m_offset, $use_hex);
+        [$meta['parent_post_hash'], $m_offset] = static::readString($meta_raw, $m_offset, $use_hex);
+        [$body, $m_offset] = static::readString($meta_raw, $m_offset);
+        $meta['data'] = json_decode($body, true);
         [$meta['reward_points'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['stake_points'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['timestamp_nanos'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
@@ -102,20 +123,16 @@ class Tx {
         break;
 
       case static::UPDATE_PROFILE:
-        [$pubkey_hex, $m_offset] = static::readString($meta_raw, $m_offset);
-        $meta['pubkey'] = static::hexToBase58Check($pubkey_hex);
-        
-        [$username_hex, $m_offset] = static::readString($meta_raw, $m_offset);
-        $meta['username'] = hex2bin($username_hex);
+        [$pubkey, $m_offset] = static::readString($meta_raw, $m_offset);
+        $meta['pubkey'] = static::adaptBase58Check($pubkey, $use_hex);
 
-        [$description_hex, $m_offset] = static::readString($meta_raw, $m_offset);
-        $meta['description'] = hex2bin($description_hex);
+        [$meta['username'], $m_offset] = static::readString($meta_raw, $m_offset);
+        [$meta['description'], $m_offset] = static::readString($meta_raw, $m_offset);
 
-        [$avatar_hex, $m_offset] = static::readString($meta_raw, $m_offset);
-        $meta['avatar'] = hex2bin($avatar_hex);
+        [$meta['avatar'], $m_offset] = static::readString($meta_raw, $m_offset);
 
         [$meta['reward_points'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        [$meta['stake_point'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        [$meta['stake_points'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['is_hidden'], $m_offset] = VarInt::readBool($meta_raw, $m_offset);
 
         break;
@@ -123,174 +140,382 @@ class Tx {
       case static::UPDATE_BITCOIN_USD_EXCHANGE_RATE:
         [$meta['btc_usd_rate'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         break;
-      
+
       case static::FOLLOW:
-        $pubkey_hex = substr($meta_raw, $m_offset, 66);
-        $meta['pubkey'] = static::hexToBase58Check($pubkey_hex);
-        $m_offset += 66;
+        $meta['pubkey'] = static::adaptBase58Check(substr($meta_raw, $m_offset, 33), $use_hex);
+        $m_offset += 33;
 
         [$meta['is_unfollow'], $m_offset] = VarInt::readBool($meta_raw, $m_offset);
-        
+
         break;
-      
+
       case static::LIKE:
-        $meta['post_hex'] = substr($meta_raw, $m_offset, 64);
-        $m_offset += 64;
+        $meta['post_hash'] = static::adaptHex(substr($meta_raw, $m_offset, 32), $use_hex);
+        $m_offset += 32;
         [$meta['is_unlike'], $m_offset] = VarInt::readBool($meta_raw, $m_offset);
         break;
 
       case static::CREATOR_COIN:
         // pubkey
         [$pubkey_len, $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        $pubkey_hex = substr($meta_raw, $m_offset, $pubkey_len * 2);
-        $meta['creator'] = static::hexToBase58Check($pubkey_hex);
+        // Creator pubkey
+        $meta['pubkey'] = static::adaptBase58Check(substr($meta_raw, $m_offset, $pubkey_len), $use_hex);
 
-        $m_offset += $pubkey_len * 2;
-
-        [$meta['operation_id'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        $m_offset += 2;
+        $m_offset += $pubkey_len;
+        $meta['operation_id'] = ord(substr($meta_raw, $m_offset, 1));
+        ++$m_offset;
 
         [$meta['spend'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['coins'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['add'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        [$meta['amount_expected'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        [$meta['coin_expected'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        [$meta['value_expected'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        [$meta['coins_expected'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         break;
 
       case static::SWAP_IDENTITY:
-        [$pubkey_hex, $m_offset] = static::readString($meta_raw, $m_offset);
-        $meta['pubkey1'] = static::hexToBase58Check($pubkey_hex);
+        [$pubkey1, $m_offset] = static::readString($meta_raw, $m_offset);
+        $meta['pubkey1'] = static::adaptBase58Check($pubkey1, $use_hex);
 
-        [$pubkey_hex, $m_offset] = static::readString($meta_raw, $m_offset);
-        $meta['pubkey2'] = static::hexToBase58Check($pubkey_hex);
+        [$pubkey2, $m_offset] = static::readString($meta_raw, $m_offset);
+        $meta['pubkey2'] = static::adaptBase58Check($pubkey2, $use_hex);
         break;
 
       case static::CREATOR_COIN_TRANSFER:
         // creator pubkey
         [$pubkey_len, $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        $pubkey_hex = substr($meta_raw, $m_offset, $pubkey_len * 2);
-        $meta['creator'] = static::hexToBase58Check($pubkey_hex);
-        $m_offset += $pubkey_len * 2;
-        
+        $meta['pubkey'] = static::adaptBase58Check(substr($meta_raw, $m_offset, $pubkey_len), $use_hex);
+        $m_offset += $pubkey_len;
+
         // Coins to transfer
         [$meta['amount'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
 
         // Receiver
         [$pubkey_len, $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        $pubkey_hex = substr($meta_raw, $m_offset, $pubkey_len * 2);
-        $meta['receiver'] = static::hexToBase58Check($pubkey_hex);
-        $m_offset += $pubkey_len * 2;
+        $meta['receiver'] = static::adaptBase58Check(substr($meta_raw, $m_offset, $pubkey_len), $use_hex);
+        $m_offset += $pubkey_len;
         break;
 
       case static::CREATE_NFT:
-        $meta['post_hex'] = substr($meta_raw, 0, 64);
-        $m_offset += 64;
+        $meta['post_hash'] = static::adaptHex(substr($meta_raw, 0, 32), $use_hex);
+        $m_offset += 32;
 
         [$meta['num_copies'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['has_unlockable'], $m_offset] = VarInt::readBool($meta_raw, $m_offset);
-        [$meta['is_for_sale'], $m_offset] = VarInt::readBool($meta_raw, $m_offset);
+        [$meta['is_selling'], $m_offset] = VarInt::readBool($meta_raw, $m_offset);
         [$meta['min_bid_amount'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['royalty_to_creator_points'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['royalty_to_coin_points'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         break;
 
       case static::UPDATE_NFT:
-        $meta['post_hex'] = substr($meta_raw, 0, 64);
-        $m_offset += 64;
+        $meta['post_hash'] = static::adaptHex(substr($meta_raw, 0, 32), $use_hex);
+        $m_offset += 32;
 
-        [$meta['serial_number'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        [$meta['is_for_sale'], $m_offset] = VarInt::readBool($meta_raw, $m_offset);
+        [$meta['serial'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        [$meta['is_selling'], $m_offset] = VarInt::readBool($meta_raw, $m_offset);
         [$meta['min_bid_amount'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         break;
 
       case static::ACCEPT_NFT_BID:
-        $meta['post_hex'] = substr($meta_raw, 0, 64);
-        $m_offset += 64;
+        $meta['post_hash'] = static::adaptHex(substr($meta_raw, 0, 32), $use_hex);
+        $m_offset += 32;
 
-        [$meta['serial_number'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        [$pubkey_hex, $m_offset] = static::readString($meta_raw, $m_offset);
-        $meta['pubkey'] = static::hexToBase58Check($pubkey_hex);
+        [$meta['serial'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        [$pubkey, $m_offset] = static::readString($meta_raw, $m_offset);
+        $meta['pubkey'] = static::adaptBase58Check($pubkey, $use_hex);
         [$meta['amount'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$unlockable_len, $m_offset] = VarInt::readUint($meta_raw, $m_offset);
-        $meta['unlockable_text'] = substr($meta_raw, $m_offset, $unlockable_len * 2);
-        $m_offset += $unlockable_len * 2;
-        [$meta['inputs'], $m_offset] = static::readInputs($meta_raw, $m_offset);
+        $meta['unlockable_text'] = static::adaptHex(substr($meta_raw, $m_offset, $unlockable_len), $use_hex);
+        $m_offset += $unlockable_len;
+        [$meta['inputs'], $m_offset] = static::readInputs($meta_raw, $m_offset, $use_hex);
         break;
 
       case static::NFT_BID:
-        $meta['post_hex'] = substr($meta_raw, 0, 64);
-        $m_offset += 64;
+        $meta['post_hash'] = static::adaptHex(substr($meta_raw, 0, 32), $use_hex);
+        $m_offset += 32;
 
-        [$meta['serial_number'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        [$meta['serial'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
         [$meta['amount'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        break;
+
+      case static::NFT_TRANSFER:
+        $meta['post_hash'] = static::adaptHex(substr($meta_raw, 0, 32), $use_hex);
+        $m_offset += 32;
+
+        [$meta['serial'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+
+        [$pubkey, $m_offset] = static::readString($meta_raw, $m_offset);
+        $meta['pubkey'] = static::adaptBase58Check($pubkey, $use_hex);
+
+        [$unlockable_len, $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        $meta['unlockable_text'] = static::adaptHex(substr($meta_raw, $m_offset, $unlockable_len), $use_hex);
+        $m_offset += $unlockable_len;
+        break;
+
+
+      case static::ACCEPT_NFT_TRANSFER:
+      case static::BURN_NFT:
+        $meta['post_hash'] = static::adaptHex(substr($meta_raw, 0, 32), $use_hex);
+        $m_offset += 32;
+
+        [$meta['serial'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        break;
+
+      case static::AUTHORIZE_DERIVED_KEY:
+        [$pubkey, $m_offset] = static::readString($meta_raw, $m_offset);
+        $meta['pubkey'] = static::adaptBase58Check($pubkey, $use_hex);
+
+        [$meta['expiration_height'], $m_offset] = VarInt::readUint($meta_raw, $m_offset);
+        $meta['operation_id'] = ord(substr($meta_raw, $m_offset, 1));
+        ++$m_offset;
+
+        // AccessSignature is the signed hash of (derivedPublicKey + expirationBlock)
+	      // made with the ownerPublicKey. Signature is in the DER format.
+        [$meta['signature'], $m_offset] = static::readString($meta_raw, $m_offset, $use_hex);
         break;
     }
 
-    $offset += $meta_len * 2;
-    [$transactor_len, $offset] = VarInt::readUint($hex, $offset);
-    $transactor = static::hexToBase58Check(substr($hex, $offset, $transactor_len * 2));
-    $offset += $transactor_len * 2;
-    [$extra_count, $offset] = VarInt::readUint($hex, $offset);
+    $offset += $meta_len;
+    [$transactor_len, $offset] = VarInt::readUint($bin, $offset);
+    $transactor = static::adaptBase58Check(substr($bin, $offset, $transactor_len), $use_hex);
+    $offset += $transactor_len;
+    [$extra_count, $offset] = VarInt::readUint($bin, $offset);
     $extra_data = [];
     while ($extra_count-- > 0) {
-      [$key_len, $offset] = VarInt::readUint($hex, $offset);
-      $key = hex2bin(substr($hex, $offset, $key_len * 2));
-      $offset += $key_len * 2;
-      [$val_len, $offset] = VarInt::readUint($hex, $offset);
+      [$key_len, $offset] = VarInt::readUint($bin, $offset);
+      $key = substr($bin, $offset, $key_len);
+      $offset += $key_len;
+      [$val_len, $offset] = VarInt::readUint($bin, $offset);
       if (in_array($key, static::UINT_KEYS)) {
-        [$val, $offset] = VarInt::readUint($hex, $offset);
+        [$val, $offset] = VarInt::readUint($bin, $offset);
       } elseif (in_array($key, static::INT_KEYS)) {
-        [$val, $offset] = VarInt::readInt($hex, $offset);
+        [$val, $offset] = VarInt::readInt($bin, $offset);
       } elseif (in_array($key, static::BOOL_KEYS)) {
-        [$val, $offset] = VarInt::readBool($hex, $offset);
+        [$val, $offset] = VarInt::readBool($bin, $offset);
       } else {
-        $val = substr($hex, $offset, $val_len * 2);
-        $offset += $val_len * 2;
+        $val = static::adaptHex(substr($bin, $offset, $val_len), $use_hex);
+        $offset += $val_len;
       }
       $extra_data[$key] = $val;
     }
 
-    [$sign_len, $offset] = VarInt::readUint($hex, $offset);
-    $signature = substr($hex, $offset, $sign_len * 2);
-    $offset += $sign_len * 2;
+    [$sign_len, $offset] = VarInt::readUint($bin, $offset);
+    $signature = substr($bin, $offset, $sign_len);
+    $offset += $sign_len;
 
     // If isset we did not parse full tx
     // var_dump(isset($hex[$offset]));
 
+    $tx_bin = substr($bin, 0, $offset);
     return [
-      'id' => static::hexToBase58Check(static::getTxHashHex($hex)),
+      'id' => $tx_id,
       'transactor' => $transactor,
       'type_id' => $type_id,
       'inputs' => $inputs,
       'outputs' => $outputs,
-      'signature' => $signature,
+      'signature' => $use_hex ? bin2hex($signature) : $signature,
       'meta' => $meta,
       'extra' => $extra_data,
+      'size' => strlen($tx_bin),
+      'raw' => $use_hex ? bin2hex($tx_bin) : $tx_bin,
     ];
   }
 
-  protected static function hexToBase58Check(string $hex): string {
-    return Base58Codec::checkEncode('cd1400' . $hex);
+  public static function toHex(array $tx, string $private_key = ''): string {
+    $bin = static::writeInputs($tx['inputs']) . static::writeOutputs($tx['outputs']);
+    $bin .= VarInt::packUint($tx['type_id']);
+    $meta = '';
+    switch ($tx['type_id']) {
+      case static::CREATOR_COIN:
+        $creator = static::base58CheckToBin($tx['meta']['creator']);
+        $meta .= VarInt::packUint(strlen($creator));
+        $meta .= $creator;
+        $meta .= chr($tx['meta']['operation_id']);
+        $meta .= VarInt::packUint($tx['meta']['spend'] ?? 0);
+        $meta .= VarInt::packUint($tx['meta']['coins'] ?? 0);
+        $meta .= VarInt::packUint($tx['meta']['add'] ?? 0);
+        $meta .= VarInt::packUint($tx['meta']['amount_expected'] ?? 0);
+        $meta .= VarInt::packUint($tx['meta']['coin_expected'] ?? 0);
+        break;
+    }
+    $bin .= VarInt::packUint(strlen($meta));
+    $bin .= $meta;
+
+    // transactor
+    $transactor = static::base58CheckToBin($tx['transactor']);
+    $bin .= VarInt::packUint(strlen($transactor));
+    $bin .= $transactor;
+
+    // extra
+    $bin .= VarInt::packUint(0);
+
+    $signature = $tx['signature'] ?? ($private_key ? static::signTransaction($bin . "\0", $private_key) : '');
+    // zero len signature
+    $bin .= $signature ? VarInt::packUint(strlen($signature)) . $signature : "\0";
+    return bin2hex($bin);
   }
 
-  protected static function readString(string $hex, int $offset = 0): array {
-    [$len, $offset] = VarInt::readUint($hex, $offset);
-    return [substr($hex, $offset, $len * 2), $offset + $len * 2];
+  public static function adaptHex(string $str, bool $use_hex): string {
+    return $use_hex ? bin2hex($str) : $str;
   }
 
-  protected static function readInputs(string $hex, int $offset = 0): array {
+  public static function adaptBase58Check(string $str, bool $use_hex): string {
+    return $use_hex ? static::binToBase58Check($str) : $str;
+  }
+  public static function getTypeMap(): array {
+    return [
+      static::UNSET => 'UNSET',
+      static::BLOCK_REWARD => 'BLOCK_REWARD',
+      static::BASIC_TRANSFER => 'BASIC_TRANSFER',
+      static::BITCOIN_EXCHANGE => 'BITCOIN_EXCHANGE',
+      static::PRIVATE_MESSAGE => 'PRIVATE_MESSAGE',
+      static::SUBMIT_POST => 'SUBMIT_POST',
+      static::UPDATE_PROFILE => 'UPDATE_PROFILE',
+      static::UPDATE_BITCOIN_USD_EXCHANGE_RATE => 'UPDATE_BITCOIN_USD_EXCHANGE_RATE',
+      static::FOLLOW => 'FOLLOW',
+      static::LIKE => 'LIKE',
+      static::CREATOR_COIN => 'CREATOR_COIN',
+      static::SWAP_IDENTITY => 'SWAP_IDENTITY',
+      static::UPDATE_GLOBAL_PARAMS => 'UPDATE_GLOBAL_PARAMS',
+      static::CREATOR_COIN_TRANSFER => 'CREATOR_COIN_TRANSFER',
+      static::CREATE_NFT => 'CREATE_NFT',
+      static::UPDATE_NFT => 'UPDATE_NFT',
+      static::ACCEPT_NFT_BID => 'ACCEPT_NFT_BID',
+      static::NFT_BID => 'NFT_BID',
+      static::NFT_TRANSFER => 'NFT_TRANSFER',
+      static::ACCEPT_NFT_TRANSFER => 'ACCEPT_NFT_TRANSFER',
+      static::BURN_NFT => 'BURN_NFT',
+      static::AUTHORIZE_DERIVED_KEY => 'AUTHORIZE_DERIVED_KEY',
+    ];
+  }
+  public static function getType(int $type_id): string {
+    return static::getTypeMap()[$type_id] ?? '';
+  }
+
+  public static function getCreatorCoinOperationMap(): array {
+    return [
+      static::COIN_BUY => 'buy',
+      static::COIN_SELL => 'sell',
+      static::COIN_ADD => 'add',
+    ];
+  }
+
+  public static function getCreatorCoinOperation(int $operation_id): string {
+    return static::getCreatorCoinOperationMap()[$operation_id] ?? '';
+  }
+
+  public static function getTxId(string $bin): string {
+    // Special case for BITCOIN_EXCHANGE
+    if (substr($bin, 0, 3) === "\0\0\3") {
+      [$meta_len, $offset] = VarInt::readUint($bin, 3);
+      [$bin, $offset] = static::readString($bin, $offset);
+      return static::hexToBase58Check(static::getTxHashHex($bin));
+    }
+    $tx_id = static::hexToBase58Check(static::getTxHashHex($bin));
+    // Genesis block work around
+    if ($tx_id === '3JuEUEgf48j68DJPn7M4RMNpBxHZo221sYm39hatrnMyUdDVyC6w3F') {
+      $tx_id = '3JuESjmiiRsfbF4AKB6y9QUMj6iAN24abbSBBhh69JxqfwPLHqW53k';
+    }
+    return $tx_id;
+  }
+
+  public static function hexToBase58Check(string $hex): string {
+    return Base58Codec::checkEncode(static::NETWORK_PREFIX . $hex);
+  }
+
+  public static function binToBase58Check(string $bin): string {
+    return static::hexToBase58Check(bin2hex($bin));
+  }
+
+
+  public static function base58CheckToHex(string $base58): string {
+    return substr(Base58Codec::checkDecode($base58), 6);
+  }
+
+  public static function base58CheckToBin(string $base58): string {
+    return hex2bin(static::base58CheckToHex($base58));
+  }
+
+  public static function getAffectedPubkeys(array $tx): array {
+    $pubkeys = array_column($tx['outputs'], 0);
+
+    $pubkeys[] = $tx['transactor'];
+    if (isset($tx['meta']['pubkey'])) {
+      $pubkeys[] = $tx['meta']['pubkey'];
+    }
+    if (isset($tx['meta']['pubkey1'])) {
+      $pubkeys[] = $tx['meta']['pubkey1'];
+    }
+    if (isset($tx['meta']['pubkey2'])) {
+      $pubkeys[] = $tx['meta']['pubkey2'];
+    }
+    if (isset($tx['meta']['receiver'])) {
+      $pubkeys[] = $tx['meta']['receiver'];
+    }
+    return array_unique($pubkeys);
+  }
+  protected static function readString(string $bin, int $offset = 0, bool $is_hex = false): array {
+    [$len, $offset] = VarInt::readUint($bin, $offset);
+    $str = substr($bin, $offset, $len);
+    return [$is_hex ? bin2hex($str) : $str, $offset + $len];
+  }
+
+  protected static function readInputs(string $bin, int $offset = 0, bool $use_hex = false): array {
     $inputs = [];
-    [$input_cnt, $offset] = VarInt::readUint($hex, $offset);
+    [$input_cnt, $offset] = VarInt::readUint($bin, $offset);
     while ($input_cnt-- > 0) {
-      $tx_id = substr($hex, $offset, 64);
-      $offset += 64;
-      [$index, $offset] = VarInt::readUint($hex, $offset);
-      $inputs[] = [static::hexToBase58Check($tx_id), $index];
+      $tx_id = substr($bin, $offset, 32);
+      $offset += 32;
+      [$index, $offset] = VarInt::readUint($bin, $offset);
+      $inputs[] = [static::adaptBase58Check($tx_id, $use_hex), $index];
     }
     return [$inputs, $offset];
   }
 
+  protected static function writeInputs(array $inputs): string {
+    $bin = VarInt::packUint(sizeof($inputs));
+    foreach ($inputs as [$tx_id, $index]) {
+      $bin .= static::base58CheckToBin($tx_id) . VarInt::packUint($index);
+    }
+    return $bin;
+  }
+
+
+  protected static function readOutputs(string $bin, int $offset = 0, bool $use_hex = false): array {
+    $outputs = [];
+    [$output_cnt, $offset] = VarInt::readUint($bin, $offset);
+    while ($output_cnt-- > 0) {
+      $pubkey = substr($bin, $offset, 33);
+      $offset += 33;
+      [$nanos, $offset] = VarInt::readUint($bin, $offset);
+      $outputs[] = [static::adaptBase58Check($pubkey, $use_hex), $nanos];
+    }
+    return [$outputs, $offset];
+  }
+
+  protected static function writeOutputs(array $outputs): string {
+    $bin = VarInt::packUint(sizeof($outputs));
+    foreach ($outputs as [$pubkey, $nanos]) {
+      $bin .= static::base58CheckToBin($pubkey) . VarInt::packUint($nanos);
+    }
+    return $bin;
+  }
+
   protected static function getTxHashHex(string $raw): string {
-    return hash('sha256', hash('sha256', hex2bin($raw), true));
+    return hash('sha256', hash('sha256', $raw, true));
+  }
+
+  public static function signTransaction(string $tx, string $key): string {
+    return hex2bin(Signature::sign(static::getTxHashHex($tx), $key));
+  }
+
+  public static function validateSignature(string $tx, string $signature, string $pubkey): bool {
+    $signature_len = strlen(VarInt::packUint(strlen($signature)) . $signature);
+    $signed_raw = substr($tx, 0, -$signature_len) . "\0";
+    return Signature::validate(static::getTxHashHex($signed_raw), $signature, $pubkey);
+  }
+
+  protected static function reverseHash(string $hash): string {
+    return implode('', array_reverse(str_split($hash, 2)));
   }
 }
